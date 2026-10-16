@@ -379,6 +379,21 @@ def run_scan():
    if result:results.append(result)
   output={"matches":results,"scanned_at":datetime.now(timezone.utc).isoformat(),"cached":False,"meta":{"fixture_page_count":len(all_matches),"in_window":len(matches),"profile_requests":0,"profiles_available":0,"profile_errors":errors,"limited_to_first_page":len(all_matches)>=100,"response_shapes":{"live":live_shape,"upcoming":upcoming_shape}},"note":"CitoAPI manual scan. Inspect response_shapes if fixture count is zero; no secrets or player records are exposed.","quota":quota_status()}
   stored_put("manual:last",output)
+  # Build all saved/cached player comparisons as part of the same manual scan.
+  # This phase makes zero additional CitoAPI calls and retains the 25/day cap.
+  enriched=[]
+  for candidate in results:
+   try:
+    status,detail=analyze_match(candidate["id"])
+    enriched.append(detail["match"] if status==200 else candidate)
+   except Exception as exc:
+    print("cached analysis error:",type(exc).__name__,flush=True)
+    enriched.append(candidate)
+  output["matches"]=enriched
+  output["meta"]["automatic_analyses"]=len(enriched)
+  output["meta"]["historical_api_requests"]=0
+  output["note"]="One-click scan: fixtures and cached ProT/EGOR comparisons calculated together. Missing categories require an independently confirmed source; no extra historical API requests."
+  stored_put("manual:last",output)
   return 200,output
  finally:SCAN_LOCK.release()
 class Handler(BaseHTTPRequestHandler):
