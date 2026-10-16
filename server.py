@@ -51,25 +51,75 @@ def stored_put(key,value):
  except Exception as e:print("cache write failure:",type(e).__name__,flush=True)
 
 
-BASE="https://api.livetennisapi.com/api/public/v1/"
+BASE="https://api.citoapi.com/api/v1/tennis/"
 SCAN_LOCK=threading.Lock()
-SCAN_TTL=0
-MAX_PROFILES=8
-def upstream(endpoint):
- token=os.getenv("TENNIS_API_TOKEN")
- if not token:raise RuntimeError("Tennis API token missing")
- remaining=max(0,int(blocked_until()-time.time()))
- if remaining:raise RuntimeError("Cooldown: "+str(remaining)+" seconds remaining")
+MAX_DAILY_REQUESTS=25
+QUOTA_LOCK=threading.Lock()
+def quota_status():
+ from datetime import datetime,timezone
+ day=datetime.now(timezone.utc).strftime("%Y-%m-%d")
+ if not os.getenv("DATABASE_URL"):return {"limit":MAX_DAILY_REQUESTS,"used":None,"remaining":0,"day_utc":day,"error":"DATABASE_URL required to enforce daily limit across restarts"}
+ saved=stored_get("cito:daily:"+day)
+ used=int(saved[0].get("used",0)) if saved and isinstance(saved[0],dict) else 0
+ return {"limit":MAX_DAILY_REQUESTS,"used":used,"remaining":max(0,MAX_DAILY_REQUESTS-used),"day_utc":day}
+def consume_quota():
+ from datetime import datetime,timezone
+ day=datetime.now(timezone.utc).strftime("%Y-%m-%d")
+ if not os.getenv("DATABASE_URL"):raise RuntimeError("DATABASE_URL is required for the 25/day safety limit")
+ # Transactional row lock ensures multiple app instances share the same hard cap.
+ import psycopg2
+ with QUOTA_LOCK:
+  conn=psycopg2.connect(os.environ["DATABASE_URL"],connect_timeout=5)
+  try:
+   cur=conn.cursor()
+   cur.execute("CREATE TABLE IF NOT EXISTS cito_daily_usage (day TEXT PRIMARY KEY, used INTEGER NOT NULL)")
+   cur.execute("INSERT INTO cito_daily_usage(day,used) VALUES (%s,0) ON CONFLICT(day) DO NOTHING",(day,))
+   cur.execute("SELECT used FROM cito_daily_usage WHERE day=%s FOR UPDATE",(day,))
+   used=cur.fetchone()[0]
+   if used>=MAX_DAILY_REQUESTS:
+    conn.commit()
+    raise RuntimeError("Daily CitoAPI safety limit reached: 25/25 requests (UTC). Try tomorrow.")
+   cur.execute("UPDATE cito_daily_usage SET used=used+1 WHERE day=%s",(day,))
+   conn.commit()
+  except Exception:
+   conn.rollback()
+   raise
+  finally:conn.close()
+def quota_status():
+ from datetime import datetime,timezone
+ day=datetime.now(timezone.utc).strftime("%Y-%m-%d")
+ if not os.getenv("DATABASE_URL"):return {"limit":25,"used":None,"remaining":0,"day_utc":day,"error":"DATABASE_URL required"}
  try:
-  with urlopen(Request(BASE+endpoint,headers={"X-API-Key":token,"Accept":"application/json"}),timeout=12) as r:return json.load(r)
+  conn,pg=cache_conn()
+  try:
+   cur=conn.cursor()
+   cur.execute("CREATE TABLE IF NOT EXISTS cito_daily_usage (day TEXT PRIMARY KEY, used INTEGER NOT NULL)")
+   cur.execute("SELECT used FROM cito_daily_usage WHERE day=%s",(day,))
+   row=cur.fetchone();conn.commit()
+   used=int(row[0]) if row else 0
+   return {"limit":25,"used":used,"remaining":max(0,25-used),"day_utc":day}
+  finally:conn.close()
+ except Exception:return {"limit":25,"used":None,"remaining":0,"day_utc":day,"error":"Quota database unavailable"}
+def upstream(endpoint):
+ token=os.getenv("CITO_API_KEY")
+ if not token:raise RuntimeError("CITO_API_KEY missing in Render environment")
+ consume_quota()
+ try:
+  with urlopen(Request(BASE+endpoint,headers={"x-api-key":token,"Accept":"application/json"}),timeout=12) as r:return json.load(r)
  except HTTPError as e:
-  if e.code==429:record_limit();raise RuntimeError("Provider HTTP 429: protective cooldown activated")
-  raise RuntimeError("Provider HTTP "+str(e.code))
+  if e.code==429:raise RuntimeError("CitoAPI HTTP 429: provider rate limit reached (not an app cooldown)")
+  raise RuntimeError("CitoAPI HTTP "+str(e.code))
+ except Exception as e:
+  if isinstance(e,RuntimeError):raise
+  raise RuntimeError("CitoAPI connection error: "+type(e).__name__)
 def records(data):
  if isinstance(data,list):return data
  if isinstance(data,dict):
-  for k in ("data","fixtures","matches","results"):
+  for k in ("data","fixtures","matches","results","events"):
    if isinstance(data.get(k),list):return data[k]
+   if isinstance(data.get(k),dict):
+    nested=records(data[k])
+    if nested:return nested
  return []
 def roster(m):
  p=m.get("players")
@@ -150,30 +200,26 @@ def run_scan():
  from datetime import datetime,timezone
  if not SCAN_LOCK.acquire(False):return 409,{"error":"A scan is already running"}
  try:
-  old=stored_get("manual:last")
-  try:raw=upstream("fixtures?"+urlencode({"draw":"singles","limit":100,"offset":0}))
-  except RuntimeError as e:
-   result=snapshot();result["note"]=str(e);result["data_state"]="unavailable" if not result.get("scanned_at") else "stale";result["retry_seconds"]=max(0,int(blocked_until()-time.time()));return 200,result
-  all_matches=records(raw);now=datetime.now(timezone.utc);matches=[m for m in all_matches if relevant(m,now)]
-  profiles={};ids=[]
-  for m in matches:
-   for p in roster(m):
-    pid=str(p.get("id") or "")
-    if pid.isdigit() and pid not in ids:ids.append(pid)
-  errors=[];requests=0
-  for pid in ids:
-   saved=stored_get("player:"+pid)
-   if saved and time.time()-saved[1]<604800:profiles[pid]=saved[0];continue
-   if requests>=MAX_PROFILES:break
-   requests+=1
+  try:
+   raw_live=upstream("matches/live")
+   all_matches=records(raw_live)
+   # The second call retrieves upcoming matches; never exceed the shared 25/day cap.
+   errors=[];requests=0;profiles={}
    try:
-    profile=upstream("players/"+pid)
-    if isinstance(profile,dict):
-     if isinstance(profile.get("data"),dict):profile=profile["data"]
-     profiles[pid]=profile;stored_put("player:"+pid,profile)
-   except RuntimeError as e:
-    errors.append(str(e))
-    if "429" in str(e) or "Cooldown" in str(e):break
+    raw_upcoming=upstream("matches/upcoming")
+    seen={str(m.get("id") or m.get("match_id") or i) for i,m in enumerate(all_matches) if isinstance(m,dict)}
+    for m in records(raw_upcoming):
+     if isinstance(m,dict):
+      mid=str(m.get("id") or m.get("match_id") or "")
+      if not mid or mid not in seen:
+       all_matches.append(m)
+       if mid:seen.add(mid)
+   except RuntimeError as e:errors.append(str(e))
+  except RuntimeError as e:
+   result=snapshot();result["note"]=str(e);result["data_state"]="unavailable" if not result.get("scanned_at") else "stale";result["quota"]=quota_status();return 200,result
+  now=datetime.now(timezone.utc)
+  matches=[m for m in all_matches if relevant(m,now)]
+  # Do not spend additional requests on profiles until CitoAPI's response schema is validated.
   results=[]
   for m in matches:
    copied=dict(m);sides=roster(m)
@@ -186,7 +232,7 @@ def run_scan():
    copied["players"]=sides
    result=summarize(copied)
    if result:results.append(result)
-  output={"matches":results,"scanned_at":datetime.now(timezone.utc).isoformat(),"cached":False,"meta":{"fixture_page_count":len(all_matches),"in_window":len(matches),"profile_requests":requests,"profiles_available":len(profiles),"profile_errors":errors,"limited_to_first_page":len(all_matches)>=100},"note":"Manual scan only. No invented market odds, Elo momentum or injury verification."}
+  output={"matches":results,"scanned_at":datetime.now(timezone.utc).isoformat(),"cached":False,"meta":{"fixture_page_count":len(all_matches),"in_window":len(matches),"profile_requests":0,"profiles_available":0,"profile_errors":errors,"limited_to_first_page":len(all_matches)>=100},"note":"CitoAPI manual scan. Detailed player stats require separate schema validation.","quota":quota_status()}
   stored_put("manual:last",output)
   return 200,output
  finally:SCAN_LOCK.release()
@@ -200,9 +246,9 @@ class Handler(BaseHTTPRequestHandler):
    with open("index.html","rb") as f:return self.send(200,f.read(),"text/html; charset=utf-8")
   if path=="/manifest.webmanifest":
    with open("manifest.webmanifest","rb") as f:return self.send(200,f.read(),"application/manifest+json")
-  if path=="/health":return self.send(200,{"ok":True,"configured":bool(os.getenv("TENNIS_API_TOKEN"))})
-  if path=="/api/status":return self.send(200,{"retry_seconds":max(0,int(blocked_until()-time.time())),"manual_only":True,"last_scan":snapshot().get("scanned_at")})
-  if path=="/api/results":return self.send(200,snapshot())
+  if path=="/health":return self.send(200,{"ok":True,"configured":bool(os.getenv("CITO_API_KEY"))})
+  if path=="/api/status":return self.send(200,{"retry_seconds":0,"manual_only":True,"last_scan":snapshot().get("scanned_at"),"quota":quota_status()})
+  if path=="/api/results":return self.send(200,dict(snapshot(),quota=quota_status()))
   if path=="/api/scan":return self.send(405,{"error":"Use POST to start a scan"})
   return self.send(404,{"error":"Not found"})
  def do_POST(self):
