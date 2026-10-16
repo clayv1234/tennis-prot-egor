@@ -261,8 +261,14 @@ def extract_metrics(raw):
 def cached_fetch(endpoint,ttl=604800):
  key="cito:historical:"+endpoint
  old=stored_get(key)
- if old and time.time()-old[1]<ttl:return old[0],False
- data=upstream(endpoint)
+ if old and time.time()-old[1]<ttl:
+  if isinstance(old[0],dict) and old[0].get("_endpoint_error"):raise RuntimeError(old[0]["_endpoint_error"]+" (cached; no new API call)")
+  return old[0],False
+ try:data=upstream(endpoint)
+ except RuntimeError as e:
+  if "HTTP 422" in str(e) or "HTTP 404" in str(e):
+   stored_put(key,{"_endpoint_error":str(e)})
+  raise
  stored_put(key,data)
  return data,True
 def analyze_match(match_id):
@@ -276,27 +282,18 @@ def analyze_match(match_id):
   return 422,{"error":"Fixture has no player IDs. Cannot fetch historical statistics reliably.","match":match}
  from urllib.parse import quote
  fetched=0;issues=[];stats=[];forms=[]
+ # Cost-conscious mode: use the two known-working form endpoints only.
+ # Player stats endpoints returned HTTP 422; do not retry them.
+ # H2H is skipped to avoid spending a fifth request on an unconfirmed endpoint.
  for p in players:
   pid=quote(str(p["id"]),safe="")
-  try:
-   surface=str(match.get("surface") or "").strip().lower()
-   query="?surface="+quote(surface,safe="") if surface in ("hard","clay","grass","carpet") else ""
-   data,new=cached_fetch("players/"+pid+"/stats"+query)
-   fetched+=int(new);stats.append(extract_metrics(data))
-   # Schema metadata is retained so a missing field can be diagnosed without further requests.
-  except RuntimeError as e:issues.append(str(p["name"])+" stats: "+str(e));stats.append({})
- for p in players:
-  pid=quote(str(p["id"]),safe="")
+  stats.append({})
   try:
    data,new=cached_fetch("players/"+pid+"/form")
    fetched+=int(new);forms.append(numeric_fields(unwrap(data)))
   except RuntimeError as e:issues.append(str(p["name"])+" form: "+str(e));forms.append({})
  h2h=None
- try:
-  a=quote(str(players[0]["id"]),safe="");b=quote(str(players[1]["id"]),safe="")
-  data,new=cached_fetch("h2h?player1_id="+a+"&player2_id="+b)
-  fetched+=int(new);h2h=unwrap(data)
- except RuntimeError as e:issues.append("H2H: "+str(e))
+ issues.append("Detailed 10-category serve/return API endpoint disabled after HTTP 422 responses; historical form remains available.")
  comparisons=[];counts=[0,0]
  for label,_,direction in METRICS:
   a,b=stats[0].get(label),stats[1].get(label)
@@ -318,10 +315,15 @@ def analyze_match(match_id):
  match["egor_grade"]="A" if coverage==10 and max(counts)>=8 else "B" if coverage>=8 and max(counts)>=6 else "C — incomplete"
  match["valuation"]="Underdog/favorite and under/overvaluation require independent two-sided market odds; CitoAPI odds are not yet available."
  match["form_fields"]=forms
+ if len(forms)==2:
+  w=[stat_value(x,["winPct","win_pct"]) for x in forms]
+  if all(x is not None for x in w):
+   match["recent_form_leader"]=players[0]["name"] if w[0]>w[1] else players[1]["name"] if w[1]>w[0] else None
+   match["close_filters"].append({"filter":"Recent form (30 days)","detail":players[0]["name"]+" "+str(w[0])+"% vs "+players[1]["name"]+" "+str(w[1])+"%; raw form only, not adjusted for opponent strength"})
  match["h2h"]=h2h if isinstance(h2h,dict) else None
  match["analysis_issues"]=issues
  match["historical_requests"]=fetched
- match["historical_scope"]="CitoAPI player statistics"+(" filtered to "+str(match.get("surface"))+" surface" if str(match.get("surface") or "").lower() in ("hard","clay","grass","carpet") else "; all surfaces")+". Sample dates and opponent strength depend on provider response."
+ match["historical_scope"]="CitoAPI recent form (30 days), two cached player requests maximum; detailed serve/return endpoint paused after HTTP 422."
  match["prot_pass"]=coverage==10 and max(counts)>=7
  # Cache analyzed match and reuse it on page reload without extra provider requests.
  stored_put("analysis:"+str(match_id),match)
