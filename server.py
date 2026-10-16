@@ -193,7 +193,16 @@ def summarize(m):
   r=x.get("ranking")
   return r.get("rank") or r.get("position") if isinstance(r,dict) else r
  grade=("A" if score>=9 else "B+" if score==8 else "B" if score==7 else "C") if n==10 else "Incomplete"
- return {"id":str(m.get("id") or m.get("fixture_id") or (p[0]["name"]+"-"+p[1]["name"])),"players":[{"name":x["name"],"id":x.get("id"),"elo":elo(x),"ranking":rank(x)} for x in p],"start":start_time(m).isoformat() if start_time(m) else None,"status":m.get("status") or m.get("match_status"),"surface":m.get("surface"),"comparisons":comparisons,"coverage":n,"counts":counts,"leader":lead,"score":score,"grade":grade,"prot_pass":n==10 and lead is not None and 7<=score<=9,"egor_pass":False,"cold_pass":False,"reason":"Independent market favorite, historical Elo and fitness data not available","prices":None}
+ # Provisional evidence only: a prediction requires at least 7 paired metrics.
+ predicted=p[lead]["name"] if lead is not None and n>=7 and score>=6 else None
+ close=[]
+ if n:
+  close.append({"filter":"ProT 2.0","detail":str(score)+"/10 advantages with "+str(n)+"/10 metrics available; "+str(max(0,7-score))+" more category advantages to reach the 7/10 benchmark" if score<7 else str(score)+"/10 advantages; "+str(max(0,10-n))+" metric(s) still missing"})
+  close.append({"filter":"EGOR","detail":"Serve/return dominance "+str(score)+"/"+str(n)+"; independent favorite confirmation still needed"})
+ else:
+  close=[{"filter":"ProT 2.0","detail":"0/10 paired metrics available; cannot measure proximity yet"},{"filter":"EGOR","detail":"Serve/return comparison and market favorite data needed"},{"filter":"Cold Drinks 2.0","detail":"Surface Elo, dated momentum, opponent-adjusted form, live control, ranking movement and fitness needed"}]
+ if n:close.append({"filter":"Cold Drinks 2.0","detail":"Historical Elo, momentum, opponent quality and injury/fitness checks still needed"})
+ return {"id":str(m.get("id") or m.get("fixture_id") or (p[0]["name"]+"-"+p[1]["name"])),"players":[{"name":x["name"],"id":x.get("id"),"elo":elo(x),"ranking":rank(x)} for x in p],"start":start_time(m).isoformat() if start_time(m) else None,"status":m.get("status") or m.get("match_status"),"surface":m.get("surface"),"comparisons":comparisons,"coverage":n,"counts":counts,"leader":lead,"score":score,"grade":grade,"prot_pass":n==10 and lead is not None and 7<=score<=9,"egor_pass":False,"cold_pass":False,"reason":"Independent market favorite, historical Elo and fitness data not available","prices":None,"predicted_winner":predicted,"prediction_basis":"Provisional statistical lean, not a calibrated win probability" if predicted else "Awaiting statistical evidence","close_filters":close}
 def snapshot():
  saved=stored_get("manual:last")
  if saved:return dict(saved[0],cached=True)
