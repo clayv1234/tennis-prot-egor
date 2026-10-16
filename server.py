@@ -1,4 +1,4 @@
-import os,json,time
+import os,json,time,sqlite3,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
 from urllib.parse import urlparse,parse_qs,urlencode
@@ -9,6 +9,41 @@ PLAYER_CACHE={}
 PLAYER_CACHE_TTL=86400
 ENRICHED_CACHE={}
 RATE_LIMIT_UNTIL=0
+DB_LOCK=threading.Lock()
+def cache_conn():
+ url=os.getenv("DATABASE_URL","")
+ if url:
+  import psycopg2
+  return psycopg2.connect(url,connect_timeout=5),True
+ conn=sqlite3.connect(os.getenv("CACHE_PATH","/tmp/tennis_prot_cache.sqlite"),timeout=10)
+ return conn,False
+def stored_get(key):
+ try:
+  with DB_LOCK:
+   conn,pg=cache_conn()
+   try:
+    cur=conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS tennis_cache (key TEXT PRIMARY KEY, payload TEXT NOT NULL, saved DOUBLE PRECISION NOT NULL)")
+    cur.execute("SELECT payload,saved FROM tennis_cache WHERE key="+("%s" if pg else "?"),(key,))
+    row=cur.fetchone()
+    conn.commit()
+    return (json.loads(row[0]),row[1]) if row else None
+   finally:conn.close()
+ except Exception as e:
+  print("cache read failure:",type(e).__name__,flush=True)
+  return None
+def stored_put(key,value):
+ try:
+  with DB_LOCK:
+   conn,pg=cache_conn()
+   try:
+    cur=conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS tennis_cache (key TEXT PRIMARY KEY, payload TEXT NOT NULL, saved DOUBLE PRECISION NOT NULL)")
+    cur.execute("INSERT INTO tennis_cache(key,payload,saved) VALUES ("+("%s,%s,%s" if pg else "?,?,?")+") ON CONFLICT(key) DO UPDATE SET payload=excluded.payload,saved=excluded.saved",(key,json.dumps(value),time.time()))
+    conn.commit()
+   finally:conn.close()
+ except Exception as e:print("cache write failure:",type(e).__name__,flush=True)
+
 BASE="https://api.livetennisapi.com/api/public/v1/"
 class Handler(BaseHTTPRequestHandler):
  def send(self,status,body,ctype="application/json"):
@@ -45,6 +80,9 @@ class Handler(BaseHTTPRequestHandler):
   limit=min(50,max(1,int(args.get("limit",["25"])[0])))
   key=(offset,limit)
   old=ENRICHED_CACHE.get(key)
+  if not old:
+   saved=stored_get("enriched:"+str(offset)+":"+str(limit))
+   if saved:old={"data":saved[0],"at":saved[1]}
   if old and (time.time()-old["at"]<3600 or time.time()<RATE_LIMIT_UNTIL):
    cached=dict(old["data"]);cached["meta"]=dict(cached["meta"]);cached["meta"]["cached"]=True;cached["meta"]["rate_limited"]=time.time()<RATE_LIMIT_UNTIL
    return self.send(200,json.dumps(cached))
@@ -115,6 +153,7 @@ class Handler(BaseHTTPRequestHandler):
     enriched.append(copied)
    output={"data":enriched,"meta":{"fixtures":len(enriched),"player_ids":len(ids),"profiles_cached":sum(pid in PLAYER_CACHE for pid in ids),"profiles_with_stats":with_stats,"profiles_with_elo_fields":with_elo,"named_sides":with_names,"profiles_requested":min(2,len(missing)),"profile_errors":errors,"sample_fixture_fields":sorted(list(fixtures[0].keys())) if fixtures else [],"sample_player_fields":sorted(list(roster(fixtures[0])[0].keys())) if fixtures else [],"note":"Current profile Elo is not historical 30-day Elo momentum. Full serve/return comparisons need a separate data source."}}
    ENRICHED_CACHE[key]={"at":time.time(),"data":output}
+   stored_put("enriched:"+str(offset)+":"+str(limit),output)
    return self.send(200,json.dumps(output))
   except HTTPError as e:
    if e.code==429:
@@ -128,11 +167,15 @@ class Handler(BaseHTTPRequestHandler):
 
  def top10(self):
   if CACHE["data"] and time.time()-CACHE["time"]<3600:return self.send(200,json.dumps(CACHE["data"]))
+  saved=stored_get("top10")
+  if saved and time.time()-saved[1]<3600:return self.send(200,json.dumps(saved[0]))
   token=os.getenv("TENNIS_API_TOKEN")
   if not token:return self.send(503,json.dumps({"error":"API token missing"}))
   def get(endpoint):
    with urlopen(Request(BASE+endpoint,headers={"X-API-Key":token,"Accept":"application/json"}),timeout=15) as r:return json.load(r)
-  if time.time()<RATE_LIMIT_UNTIL:return self.send(200,json.dumps({"top10":[],"error":"Rate-limit cooldown: market requests paused to protect fixture quota"}))
+  if time.time()<RATE_LIMIT_UNTIL:
+   if saved:return self.send(200,json.dumps(dict(saved[0],stale=True)))
+   return self.send(200,json.dumps({"top10":[],"error":"Rate-limit cooldown: market requests paused to protect fixture quota"}))
   try:
    matches=[]
    for status in ("upcoming","live"):
@@ -176,6 +219,7 @@ class Handler(BaseHTTPRequestHandler):
    results.sort(key=lambda x:x["probability"],reverse=True)
    output={"top10":results[:10],"matched":len(matches),"checked":checked,"priced":len(results),"source":"LiveTennisAPI mapped market (NOT independent sharp sportsbook)","note":"A favorite by market price is not a model prediction. Price coverage may require PRO plan."}
    CACHE.update(time=time.time(),data=output)
+   stored_put("top10",output)
    return self.send(200,json.dumps(output))
   except HTTPError as e:return self.send(200,json.dumps({"top10":[],"matched":0,"error":"Market lookup HTTP "+str(e.code),"note":"Market prices may require PRO access."}))
   except Exception as e:return self.send(200,json.dumps({"top10":[],"matched":0,"error":str(e)[:120]}))
