@@ -114,6 +114,10 @@ class Handler(BaseHTTPRequestHandler):
     for p in roster(m):
      pid=p.get("id")
      if pid and str(pid).isdigit():ids.add(int(pid))
+   for pid in ids:
+    if pid not in PLAYER_CACHE:
+     saved=stored_get("player:"+str(pid))
+     if saved:PLAYER_CACHE[pid]={"profile":saved[0],"at":saved[1]}
    missing=[pid for pid in sorted(ids) if pid not in PLAYER_CACHE or time.time()-PLAYER_CACHE[pid]["at"]>PLAYER_CACHE_TTL]
    errors={}
    def fetch(pid):
@@ -130,7 +134,9 @@ class Handler(BaseHTTPRequestHandler):
     futures=[pool.submit(fetch,pid) for pid in missing[:2]]
     for future in as_completed(futures):
      pid,profile,error=future.result()
-     if isinstance(profile,dict):PLAYER_CACHE[pid]={"at":time.time(),"profile":profile}
+     if isinstance(profile,dict):
+      PLAYER_CACHE[pid]={"at":time.time(),"profile":profile}
+      stored_put("player:"+str(pid),profile)
      elif error:errors[str(pid)]=error
    enriched=[];with_elo=0;with_names=0;with_stats=0
    for m in fixtures:
