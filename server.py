@@ -10,15 +10,11 @@ PLAYER_CACHE_TTL=86400
 ENRICHED_CACHE={}
 RATE_LIMIT_UNTIL=0
 DB_LOCK=threading.Lock()
-COOLDOWN_SECONDS=1800
+COOLDOWN_SECONDS=0
 def blocked_until():
- saved=stored_get("api:cooldown:v2")
- return max(RATE_LIMIT_UNTIL,float(saved[0].get("until",0)) if saved and isinstance(saved[0],dict) else 0)
+ return 0
 def record_limit():
- global RATE_LIMIT_UNTIL
- RATE_LIMIT_UNTIL=time.time()+COOLDOWN_SECONDS
- stored_put("api:cooldown:v2",{"until":RATE_LIMIT_UNTIL})
- print("upstream 429: 30-minute manual-only protective cooldown",flush=True)
+ print("upstream HTTP 429: provider rate limit; no app cooldown",flush=True)
 
 def cache_conn():
  url=os.getenv("DATABASE_URL","")
@@ -57,7 +53,7 @@ def stored_put(key,value):
 
 BASE="https://api.livetennisapi.com/api/public/v1/"
 SCAN_LOCK=threading.Lock()
-SCAN_TTL=900
+SCAN_TTL=0
 MAX_PROFILES=8
 def upstream(endpoint):
  token=os.getenv("TENNIS_API_TOKEN")
@@ -155,10 +151,6 @@ def run_scan():
  if not SCAN_LOCK.acquire(False):return 409,{"error":"A scan is already running"}
  try:
   old=stored_get("manual:last")
-  if old and time.time()-old[1]<SCAN_TTL:
-   result=snapshot();result["note"]="Reusing saved scan for 15 minutes to protect quota";return 200,result
-  if time.time()<blocked_until():
-   result=snapshot();result["note"]="Provider HTTP 429 cooldown; no API request sent. Match counts are unknown, not zero.";result["data_state"]="unavailable" if not result.get("scanned_at") else "stale";result["retry_seconds"]=int(blocked_until()-time.time());return 200,result
   try:raw=upstream("fixtures?"+urlencode({"draw":"singles","limit":100,"offset":0}))
   except RuntimeError as e:
    result=snapshot();result["note"]=str(e);result["data_state"]="unavailable" if not result.get("scanned_at") else "stale";result["retry_seconds"]=max(0,int(blocked_until()-time.time()));return 200,result
