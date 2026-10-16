@@ -117,7 +117,7 @@ def response_shape(data):
 def records(data):
  if isinstance(data,list):return data
  if isinstance(data,dict):
-  for k in ("data","fixtures","matches","results","events"):
+  for k in ("data","fixtures","matches","results","events","items"):
    if isinstance(data.get(k),list):return data[k]
    if isinstance(data.get(k),dict):
     nested=records(data[k])
