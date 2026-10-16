@@ -203,6 +203,128 @@ def summarize(m):
   close=[{"filter":"ProT 2.0","detail":"0/10 paired metrics available; cannot measure proximity yet"},{"filter":"EGOR","detail":"Serve/return comparison and market favorite data needed"},{"filter":"Cold Drinks 2.0","detail":"Surface Elo, dated momentum, opponent-adjusted form, live control, ranking movement and fitness needed"}]
  if n:close.append({"filter":"Cold Drinks 2.0","detail":"Historical Elo, momentum, opponent quality and injury/fitness checks still needed"})
  return {"id":str(m.get("id") or m.get("fixture_id") or (p[0]["name"]+"-"+p[1]["name"])),"players":[{"name":x["name"],"id":x.get("id"),"elo":elo(x),"ranking":rank(x)} for x in p],"start":start_time(m).isoformat() if start_time(m) else None,"status":m.get("status") or m.get("match_status"),"surface":m.get("surface"),"comparisons":comparisons,"coverage":n,"counts":counts,"leader":lead,"score":score,"grade":grade,"prot_pass":n==10 and lead is not None and 7<=score<=9,"egor_pass":False,"cold_pass":False,"reason":"Independent market favorite, historical Elo and fitness data not available","prices":None,"predicted_winner":predicted,"prediction_basis":"Provisional statistical lean, not a calibrated win probability" if predicted else "Awaiting statistical evidence","close_filters":close}
+
+def unwrap(data):
+ while isinstance(data,dict) and isinstance(data.get("data"),dict):
+  data=data["data"]
+ return data
+def numeric_fields(obj,depth=0):
+ out={}
+ if not isinstance(obj,dict) or depth>5:return out
+ for k,v in obj.items():
+  if isinstance(v,dict):out.update(numeric_fields(v,depth+1))
+  elif isinstance(v,(int,float)) and not isinstance(v,bool):out[k.lower().replace("_","").replace("-","")]=float(v)
+  elif isinstance(v,str):
+   try:out[k.lower().replace("_","").replace("-","")]=float(v.strip().rstrip("%"))
+   except ValueError:pass
+ return out
+def stat_value(fields,aliases):
+ for k in aliases:
+  v=fields.get(k.lower().replace("_","").replace("-",""))
+  if v is not None:return v
+ return None
+STAT_ALIASES={
+ "First serves in %":["first_serve_percentage","first_serves_in","first_serve_in_pct","firstServePct","firstServePercentage","firstServeInPct"],
+ "First-serve points won %":["first_serve_points_won_percentage","first_serve_points_won_pct","firstServePointsWonPct","firstServeWonPct"],
+ "Second-serve points won %":["second_serve_points_won_percentage","second_serve_points_won_pct","secondServePointsWonPct","secondServeWonPct"],
+ "Aces per service game":["aces_per_service_game","acesPerServiceGame"],
+ "Double faults per service game":["double_faults_per_service_game","doubleFaultsPerServiceGame"],
+ "Return points won %":["return_points_won_percentage","return_points_won_pct","returnPointsWonPct"],
+ "Break-point conversion %":["break_points_converted_percentage","break_point_conversion_pct","breakPointsConvertedPct","breakPointConversionPct"],
+ "Service games held %":["service_games_held_percentage","service_games_held_pct","serviceGamesHeldPct","holdPct"],
+ "First-serve return points won %":["first_serve_return_points_won_percentage","first_serve_return_points_won_pct","firstServeReturnPointsWonPct"],
+ "Return games won %":["return_games_won_percentage","return_games_won_pct","returnGamesWonPct","breakPct"]}
+def extract_metrics(raw):
+ fields=numeric_fields(unwrap(raw))
+ out={}
+ for label,_,direction in METRICS:
+  v=stat_value(fields,STAT_ALIASES[label])
+  if v is None:
+   pairs={
+    "First serves in %":(["firstServesIn","firstServesMade"],["firstServeAttempts","servicePoints"]),
+    "First-serve points won %":(["firstServePointsWon"],["firstServePointsPlayed","firstServePoints"]),
+    "Second-serve points won %":(["secondServePointsWon"],["secondServePointsPlayed","secondServePoints"]),
+    "Return points won %":(["returnPointsWon"],["returnPointsPlayed"]),
+    "Break-point conversion %":(["breakPointsConverted"],["breakPointsChances","breakPointsOpportunities"]),
+    "Service games held %":(["serviceGamesHeld"],["serviceGamesPlayed"]),
+    "First-serve return points won %":(["firstServeReturnPointsWon"],["firstServeReturnPointsPlayed"]),
+    "Return games won %":(["returnGamesWon","breaks"],["returnGamesPlayed"]),
+    "Aces per service game":(["aces"],["serviceGamesPlayed"]),
+    "Double faults per service game":(["doubleFaults"],["serviceGamesPlayed"])}
+   if label in pairs:
+    a=stat_value(fields,pairs[label][0]);b=stat_value(fields,pairs[label][1])
+    if a is not None and b and b>0:v=round(a/b*(1 if "per service game" in label else 100),2)
+  if v is not None:
+   if "%" in label and 0<=v<=1:v=round(v*100,2)
+   out[label]=round(v,2)
+ return out
+def cached_fetch(endpoint,ttl=604800):
+ key="cito:historical:"+endpoint
+ old=stored_get(key)
+ if old and time.time()-old[1]<ttl:return old[0],False
+ data=upstream(endpoint)
+ stored_put(key,data)
+ return data,True
+def analyze_match(match_id):
+ saved=snapshot()
+ matches=saved.get("matches",[])
+ match=next((m for m in matches if str(m.get("id"))==str(match_id)),None)
+ if not match:return 404,{"error":"Match not in saved scan. Run Scan first."}
+ players=match.get("players",[])
+ if len(players)!=2:return 422,{"error":"Two players are required"}
+ if any(not str(p.get("id") or "").strip() or str(p.get("id")).lower()=="none" for p in players):
+  return 422,{"error":"Fixture has no player IDs. Cannot fetch historical statistics reliably.","match":match}
+ from urllib.parse import quote
+ fetched=0;issues=[];stats=[];forms=[]
+ for p in players:
+  pid=quote(str(p["id"]),safe="")
+  try:
+   data,new=cached_fetch("players/"+pid+"/stats")
+   fetched+=int(new);stats.append(extract_metrics(data))
+   # Schema metadata is retained so a missing field can be diagnosed without further requests.
+  except RuntimeError as e:issues.append(str(p["name"])+" stats: "+str(e));stats.append({})
+ for p in players:
+  pid=quote(str(p["id"]),safe="")
+  try:
+   data,new=cached_fetch("players/"+pid+"/form")
+   fetched+=int(new);forms.append(numeric_fields(unwrap(data)))
+  except RuntimeError as e:issues.append(str(p["name"])+" form: "+str(e));forms.append({})
+ h2h=None
+ try:
+  a=quote(str(players[0]["id"]),safe="");b=quote(str(players[1]["id"]),safe="")
+  data,new=cached_fetch("h2h?player1_id="+a+"&player2_id="+b)
+  fetched+=int(new);h2h=unwrap(data)
+ except RuntimeError as e:issues.append("H2H: "+str(e))
+ comparisons=[];counts=[0,0]
+ for label,_,direction in METRICS:
+  a,b=stats[0].get(label),stats[1].get(label)
+  lead=None
+  if a is not None and b is not None:
+   lead=0 if (a-b)*direction>0 else 1 if (a-b)*direction<0 else None
+   if lead is not None:counts[lead]+=1
+  comparisons.append({"metric":label,"a":a,"b":b,"leader":lead,"margin":round(abs(a-b),2) if a is not None and b is not None else None})
+ coverage=sum(x["a"] is not None and x["b"] is not None for x in comparisons)
+ lead=0 if counts[0]>counts[1] else 1 if counts[1]>counts[0] else None
+ match=dict(match);match["comparisons"]=comparisons;match["coverage"]=coverage;match["counts"]=counts;match["score"]=max(counts)
+ match["leader"]=lead
+ match["predicted_winner"]=players[lead]["name"] if lead is not None and coverage>=7 and max(counts)>=6 else None
+ match["prediction_basis"]="Provisional: historical category comparison; no calibrated win probability" if match["predicted_winner"] else "Historical comparisons shown; not enough complete categories for a defensible prediction"
+ match["close_filters"]=[
+  {"filter":"ProT 2.0","detail":str(counts[0])+"/10 "+players[0]["name"]+" vs "+str(counts[1])+"/10 "+players[1]["name"]+"; "+str(coverage)+"/10 categories comparable"},
+  {"filter":"EGOR","detail":"Historical serve/return dominance "+str(max(counts))+"/"+str(coverage)+"; favorite status requires independent odds. Grade "+("A" if coverage==10 and max(counts)>=8 else "B" if coverage>=8 and max(counts)>=6 else "C (incomplete)")},
+  {"filter":"Cold Drinks 2.0","detail":"Historical serve/return "+str(coverage)+"/10 categories; surface Elo, dated Elo movement, live control, opponent-adjusted form and six-month ranking momentum need separately sourced values."}]
+ match["egor_grade"]="A" if coverage==10 and max(counts)>=8 else "B" if coverage>=8 and max(counts)>=6 else "C — incomplete"
+ match["valuation"]="Underdog/favorite and under/overvaluation require independent two-sided market odds; CitoAPI odds are not yet available."
+ match["form_fields"]=forms
+ match["h2h"]=h2h if isinstance(h2h,dict) else None
+ match["analysis_issues"]=issues
+ match["historical_requests"]=fetched
+ match["historical_scope"]="CitoAPI player career aggregates; surface/recency not assumed"
+ match["prot_pass"]=coverage==10 and max(counts)>=7
+ # Cache analyzed match and reuse it on page reload without extra provider requests.
+ stored_put("analysis:"+str(match_id),match)
+ return 200,{"match":match,"quota":quota_status()}
+
 def snapshot():
  saved=stored_get("manual:last")
  if saved:return dict(saved[0],cached=True)
@@ -263,10 +385,25 @@ class Handler(BaseHTTPRequestHandler):
   if path=="/health":return self.send(200,{"ok":True,"configured":bool(os.getenv("CITO_API_KEY"))})
   if path=="/api/status":return self.send(200,{"retry_seconds":0,"manual_only":True,"last_scan":snapshot().get("scanned_at"),"quota":quota_status()})
   if path=="/api/results":return self.send(200,dict(snapshot(),quota=quota_status()))
+  if path=="/api/analysis":
+   mid=parse_qs(urlparse(self.path).query).get("id",[""])[0]
+   if not mid:return self.send(400,{"error":"Match ID required"})
+   saved=stored_get("analysis:"+mid)
+   return self.send(200,{"match":saved[0],"cached":True,"quota":quota_status()}) if saved else self.send(404,{"error":"No saved analysis for this match"})
   if path=="/api/scan":return self.send(405,{"error":"Use POST to start a scan"})
   return self.send(404,{"error":"Not found"})
  def do_POST(self):
-  if urlparse(self.path).path!="/api/scan":return self.send(404,{"error":"Not found"})
+  path=urlparse(self.path).path
+  if path=="/api/analyze":
+   try:
+    size=min(int(self.headers.get("Content-Length","0")),2048)
+    body=json.loads(self.rfile.read(size)) if size else {}
+    mid=str(body.get("id",""))
+    if not mid:return self.send(400,{"error":"Match ID required"})
+    status,data=analyze_match(mid)
+    return self.send(status,data)
+   except Exception as e:return self.send(500,{"error":"Analysis error: "+type(e).__name__})
+  if path!="/api/scan":return self.send(404,{"error":"Not found"})
   status,data=run_scan();return self.send(status,data)
 if __name__=="__main__":
  ThreadingHTTPServer(("0.0.0.0",int(os.getenv("PORT","10000"))),Handler).serve_forever()
