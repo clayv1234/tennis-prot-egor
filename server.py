@@ -1,9 +1,12 @@
 import os,json,time
+from concurrent.futures import ThreadPoolExecutor,as_completed
 from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
 from urllib.parse import urlparse,parse_qs,urlencode
 from urllib.request import Request,urlopen
 from urllib.error import HTTPError
 CACHE={"time":0,"data":None}
+PLAYER_CACHE={}
+PLAYER_CACHE_TTL=21600
 BASE="https://api.livetennisapi.com/api/public/v1/"
 class Handler(BaseHTTPRequestHandler):
  def send(self,status,body,ctype="application/json"):
@@ -18,6 +21,7 @@ class Handler(BaseHTTPRequestHandler):
   if path.path=="/health":
    return self.send(200,json.dumps({"ok":True,"configured":bool(os.getenv("TENNIS_API_TOKEN"))}))
   if path.path=="/api/top10":return self.top10()
+  if path.path=="/api/enriched":return self.enriched(path.query)
   if path.path!="/api/fixtures":return self.send(404,'{"error":"Not found"}')
   token=os.getenv("TENNIS_API_TOKEN")
   if not token:return self.send(503,'{"error":"API token not configured on server"}')
@@ -27,6 +31,70 @@ class Handler(BaseHTTPRequestHandler):
    with urlopen(Request(BASE+"fixtures?"+urlencode(args),headers={"Accept":"application/json"}),timeout=25) as r: return self.send(200,r.read())
   except HTTPError as e:return self.send(502,json.dumps({"error":"Tennis API HTTP "+str(e.code)}))
   except Exception as e:return self.send(502,json.dumps({"error":"Tennis API connection failed","detail":str(e)}))
+
+
+ def enriched(self,query):
+  token=os.getenv("TENNIS_API_TOKEN")
+  if not token:return self.send(503,json.dumps({"error":"API token not configured"}))
+  args=parse_qs(query)
+  offset=min(900,max(0,int(args.get("offset",["0"])[0])))
+  limit=min(40,max(1,int(args.get("limit",["25"])[0])))
+  def get(endpoint):
+   with urlopen(Request(BASE+endpoint,headers={"X-API-Key":token,"Accept":"application/json"}),timeout=18) as r:return json.load(r)
+  try:
+   result=get("fixtures?"+urlencode({"draw":"singles","limit":limit,"offset":offset}))
+   fixtures=result.get("data",result.get("fixtures",[])) if isinstance(result,dict) else result
+   if not isinstance(fixtures,list):fixtures=[]
+   ids=set()
+   def players(m):
+    p=m.get("players") or {}
+    if isinstance(p,dict):
+     return [p.get("p1"),p.get("p2")]
+    if isinstance(p,list):return p[:2]
+    return [m.get("player1") or m.get("home_player"),m.get("player2") or m.get("away_player")]
+   for m in fixtures:
+    for p in players(m):
+     if not isinstance(p,dict):continue
+     pid=p.get("id") or p.get("player_id")
+     if isinstance(pid,int) or (isinstance(pid,str) and pid.isdigit()):ids.add(int(pid))
+   missing=[pid for pid in ids if pid not in PLAYER_CACHE or time.time()-PLAYER_CACHE[pid]["at"]>PLAYER_CACHE_TTL]
+   def fetch(pid):
+    try:
+     profile=get("players/"+str(pid))
+     if isinstance(profile,dict) and isinstance(profile.get("data"),dict):profile=profile["data"]
+     return pid,profile,None
+    except HTTPError as e:return pid,None,"HTTP "+str(e.code)
+    except Exception as e:return pid,None,type(e).__name__
+   errors={}
+   # Cap profile reads to avoid burning a user's API quota in one scan.
+   with ThreadPoolExecutor(max_workers=3) as pool:
+    futures=[pool.submit(fetch,pid) for pid in missing[:24]]
+    for future in as_completed(futures):
+     pid,profile,error=future.result()
+     if profile:PLAYER_CACHE[pid]={"at":time.time(),"profile":profile}
+     elif error:errors[str(pid)]=error
+   enriched=[]
+   for m in fixtures:
+    sides=players(m)
+    copied=dict(m)
+    names=[]
+    for i,p in enumerate(sides):
+     pid=(p.get("id") or p.get("player_id")) if isinstance(p,dict) else None
+     cached=PLAYER_CACHE.get(int(pid)) if pid and str(pid).isdigit() else None
+     profile=cached["profile"] if cached else None
+     side=dict(p) if isinstance(p,dict) else {"name":str(p)} if p else {}
+     if profile:
+      side["stats"]=profile.get("stats") or {}
+      side["ranking"]=profile.get("ranking")
+      side["profile_source"]="GET /players/"+str(pid)
+     names.append(side)
+    copied["players"]=names
+    enriched.append(copied)
+   stats_found=sum(1 for m in enriched for p in m["players"] if p.get("stats"))
+   output={"data":enriched,"meta":{"fixtures":len(enriched),"player_ids":len(ids),"profiles_cached":sum(pid in PLAYER_CACHE for pid in ids),"profiles_with_stats":stats_found,"profiles_requested":min(24,len(missing)),"profile_errors":errors,"note":"Cached player profiles provide season and ratings fields only where supplied. Full ten-category serve/return stats may be absent."}}
+   return self.send(200,json.dumps(output))
+  except HTTPError as e:return self.send(502,json.dumps({"error":"Fixture API HTTP "+str(e.code)}))
+  except Exception as e:return self.send(502,json.dumps({"error":type(e).__name__+": "+str(e)[:140]}))
 
  def top10(self):
   if CACHE["data"] and time.time()-CACHE["time"]<300:return self.send(200,json.dumps(CACHE["data"]))
