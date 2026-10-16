@@ -55,13 +55,6 @@ BASE="https://api.citoapi.com/api/v1/tennis/"
 SCAN_LOCK=threading.Lock()
 MAX_DAILY_REQUESTS=25
 QUOTA_LOCK=threading.Lock()
-def quota_status():
- from datetime import datetime,timezone
- day=datetime.now(timezone.utc).strftime("%Y-%m-%d")
- if not os.getenv("DATABASE_URL"):return {"limit":MAX_DAILY_REQUESTS,"used":None,"remaining":0,"day_utc":day,"error":"DATABASE_URL required to enforce daily limit across restarts"}
- saved=stored_get("cito:daily:"+day)
- used=int(saved[0].get("used",0)) if saved and isinstance(saved[0],dict) else 0
- return {"limit":MAX_DAILY_REQUESTS,"used":used,"remaining":max(0,MAX_DAILY_REQUESTS-used),"day_utc":day}
 def consume_quota():
  from datetime import datetime,timezone
  day=datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -151,7 +144,7 @@ def relevant(m,now):
  if "double" in str(m.get("draw") or "").lower():return False
  status=str(m.get("status") or m.get("match_status") or m.get("state") or "").lower()
  if any(s in status for s in ("finish","complete","final","cancel","postpon","retir","walkover")):return False
- if any(s in status for s in ("live","in_progress","in progress","playing","ongoing")):return True
+ if any(s in status for s in ("live","in_progress","in progress","playing","ongoing","inplay","in-play")):return True
  t=start_time(m)
  return bool(t and 0<=(t-now).total_seconds()<=3600)
 METRICS=[
