@@ -279,7 +279,9 @@ def analyze_match(match_id):
  for p in players:
   pid=quote(str(p["id"]),safe="")
   try:
-   data,new=cached_fetch("players/"+pid+"/stats")
+   surface=str(match.get("surface") or "").strip().lower()
+   query="?surface="+quote(surface,safe="") if surface in ("hard","clay","grass","carpet") else ""
+   data,new=cached_fetch("players/"+pid+"/stats"+query)
    fetched+=int(new);stats.append(extract_metrics(data))
    # Schema metadata is retained so a missing field can be diagnosed without further requests.
   except RuntimeError as e:issues.append(str(p["name"])+" stats: "+str(e));stats.append({})
@@ -319,7 +321,7 @@ def analyze_match(match_id):
  match["h2h"]=h2h if isinstance(h2h,dict) else None
  match["analysis_issues"]=issues
  match["historical_requests"]=fetched
- match["historical_scope"]="CitoAPI player career aggregates; surface/recency not assumed"
+ match["historical_scope"]="CitoAPI player statistics"+(" filtered to "+str(match.get("surface"))+" surface" if str(match.get("surface") or "").lower() in ("hard","clay","grass","carpet") else "; all surfaces")+". Sample dates and opponent strength depend on provider response."
  match["prot_pass"]=coverage==10 and max(counts)>=7
  # Cache analyzed match and reuse it on page reload without extra provider requests.
  stored_put("analysis:"+str(match_id),match)
