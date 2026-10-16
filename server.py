@@ -10,15 +10,15 @@ PLAYER_CACHE_TTL=86400
 ENRICHED_CACHE={}
 RATE_LIMIT_UNTIL=0
 DB_LOCK=threading.Lock()
-COOLDOWN_SECONDS=21600
+COOLDOWN_SECONDS=1800
 def blocked_until():
- saved=stored_get("api:cooldown")
+ saved=stored_get("api:cooldown:v2")
  return max(RATE_LIMIT_UNTIL,float(saved[0].get("until",0)) if saved and isinstance(saved[0],dict) else 0)
 def record_limit():
  global RATE_LIMIT_UNTIL
  RATE_LIMIT_UNTIL=time.time()+COOLDOWN_SECONDS
- stored_put("api:cooldown",{"until":RATE_LIMIT_UNTIL})
- print("upstream 429: six-hour protective cooldown",flush=True)
+ stored_put("api:cooldown:v2",{"until":RATE_LIMIT_UNTIL})
+ print("upstream 429: 30-minute manual-only protective cooldown",flush=True)
 
 def cache_conn():
  url=os.getenv("DATABASE_URL","")
@@ -149,7 +149,7 @@ def summarize(m):
 def snapshot():
  saved=stored_get("manual:last")
  if saved:return dict(saved[0],cached=True)
- return {"matches":[],"scanned_at":None,"cached":True,"note":"No saved scan. Press Run Scan to request live and next-hour matches."}
+ return {"matches":[],"scanned_at":None,"cached":True,"data_state":"unavailable","note":"No successful scan saved yet. Press Run Scan to request live and next-hour matches."}
 def run_scan():
  from datetime import datetime,timezone
  if not SCAN_LOCK.acquire(False):return 409,{"error":"A scan is already running"}
@@ -158,10 +158,10 @@ def run_scan():
   if old and time.time()-old[1]<SCAN_TTL:
    result=snapshot();result["note"]="Reusing saved scan for 15 minutes to protect quota";return 200,result
   if time.time()<blocked_until():
-   result=snapshot();result["note"]="Provider cooldown; no API request sent";result["retry_seconds"]=int(blocked_until()-time.time());return 200,result
+   result=snapshot();result["note"]="Provider HTTP 429 cooldown; no API request sent. Match counts are unknown, not zero.";result["data_state"]="unavailable" if not result.get("scanned_at") else "stale";result["retry_seconds"]=int(blocked_until()-time.time());return 200,result
   try:raw=upstream("fixtures?"+urlencode({"draw":"singles","limit":100,"offset":0}))
   except RuntimeError as e:
-   result=snapshot();result["note"]=str(e);result["retry_seconds"]=max(0,int(blocked_until()-time.time()));return 200,result
+   result=snapshot();result["note"]=str(e);result["data_state"]="unavailable" if not result.get("scanned_at") else "stale";result["retry_seconds"]=max(0,int(blocked_until()-time.time()));return 200,result
   all_matches=records(raw);now=datetime.now(timezone.utc);matches=[m for m in all_matches if relevant(m,now)]
   profiles={};ids=[]
   for m in matches:
