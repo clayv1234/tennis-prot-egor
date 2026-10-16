@@ -10,6 +10,16 @@ PLAYER_CACHE_TTL=86400
 ENRICHED_CACHE={}
 RATE_LIMIT_UNTIL=0
 DB_LOCK=threading.Lock()
+COOLDOWN_SECONDS=21600
+def blocked_until():
+ saved=stored_get("api:cooldown")
+ return max(RATE_LIMIT_UNTIL,float(saved[0].get("until",0)) if saved and isinstance(saved[0],dict) else 0)
+def record_limit():
+ global RATE_LIMIT_UNTIL
+ RATE_LIMIT_UNTIL=time.time()+COOLDOWN_SECONDS
+ stored_put("api:cooldown",{"until":RATE_LIMIT_UNTIL})
+ print("upstream 429: six-hour protective cooldown",flush=True)
+
 def cache_conn():
  url=os.getenv("DATABASE_URL","")
  if url:
@@ -57,6 +67,9 @@ class Handler(BaseHTTPRequestHandler):
    return self.send(200,open("manifest.webmanifest","rb").read(),"application/manifest+json")
   if path.path=="/health":
    return self.send(200,json.dumps({"ok":True,"configured":bool(os.getenv("TENNIS_API_TOKEN"))}))
+  if path.path=="/api/status":
+   until=blocked_until()
+   return self.send(200,json.dumps({"api_cooldown":time.time()<until,"retry_seconds":max(0,int(until-time.time())),"note":"Protective cooldown; provider quota reset unknown"}))
   if path.path=="/api/top10":return self.top10()
   if path.path=="/api/enriched":return self.enriched(path.query)
   if path.path!="/api/fixtures":return self.send(404,'{"error":"Not found"}')
@@ -64,9 +77,12 @@ class Handler(BaseHTTPRequestHandler):
   if not token:return self.send(503,'{"error":"API token not configured on server"}')
   q=parse_qs(path.query); args={k:v[0] for k,v in q.items() if k in ("draw","limit","offset","date")}
   args.setdefault("draw","singles");args.setdefault("limit","100");args["token"]=token
+  if time.time()<blocked_until():return self.send(429,json.dumps({"error":"Upstream API cooldown","retry_seconds":int(blocked_until()-time.time())}))
   try:
    with urlopen(Request(BASE+"fixtures?"+urlencode(args),headers={"Accept":"application/json"}),timeout=25) as r: return self.send(200,r.read())
-  except HTTPError as e:return self.send(502,json.dumps({"error":"Tennis API HTTP "+str(e.code)}))
+  except HTTPError as e:
+   if e.code==429:record_limit()
+   return self.send(502,json.dumps({"error":"Tennis API HTTP "+str(e.code)}))
   except Exception as e:return self.send(502,json.dumps({"error":"Tennis API connection failed","detail":str(e)}))
 
 
@@ -83,10 +99,10 @@ class Handler(BaseHTTPRequestHandler):
   if not old:
    saved=stored_get("enriched:"+str(offset)+":"+str(limit))
    if saved:old={"data":saved[0],"at":saved[1]}
-  if old and (time.time()-old["at"]<3600 or time.time()<RATE_LIMIT_UNTIL):
+  if old and (time.time()-old["at"]<3600 or time.time()<blocked_until()):
    cached=dict(old["data"]);cached["meta"]=dict(cached["meta"]);cached["meta"]["cached"]=True;cached["meta"]["rate_limited"]=time.time()<RATE_LIMIT_UNTIL
    return self.send(200,json.dumps(cached))
-  if time.time()<RATE_LIMIT_UNTIL:return self.send(429,json.dumps({"error":"Tennis API rate limit. Retry later; cached data unavailable.","retry_seconds":int(RATE_LIMIT_UNTIL-time.time())}))
+  if time.time()<RATE_LIMIT_UNTIL:return self.send(429,json.dumps({"error":"Tennis API rate limit. Retry later; cached data unavailable.","retry_seconds":int(blocked_until()-time.time())}))
   def get(endpoint):
    with urlopen(Request(BASE+endpoint,headers={"X-API-Key":token,"Accept":"application/json"}),timeout=20) as r:return json.load(r)
   def roster(m):
@@ -126,7 +142,7 @@ class Handler(BaseHTTPRequestHandler):
      if isinstance(profile,dict) and isinstance(profile.get("data"),dict):profile=profile["data"]
      return pid,profile,None
     except HTTPError as e:
-     if e.code==429:RATE_LIMIT_UNTIL=time.time()+900
+     if e.code==429:record_limit()
      return pid,None,"HTTP "+str(e.code)
     except Exception as e:return pid,None,type(e).__name__
    # Fetch only two new profiles per batch to preserve API quota.
@@ -163,18 +179,18 @@ class Handler(BaseHTTPRequestHandler):
    return self.send(200,json.dumps(output))
   except HTTPError as e:
    if e.code==429:
-    RATE_LIMIT_UNTIL=time.time()+900
+    record_limit()
     if old:
      cached=dict(old["data"]);cached["meta"]=dict(cached["meta"]);cached["meta"]["cached"]=True;cached["meta"]["rate_limited"]=True
      return self.send(200,json.dumps(cached))
-    return self.send(429,json.dumps({"error":"Tennis API HTTP 429: quota exhausted. Automatic retry after cooldown.","retry_seconds":900}))
+    return self.send(429,json.dumps({"error":"Tennis API HTTP 429: quota exhausted. Automatic retry after cooldown.","retry_seconds":COOLDOWN_SECONDS}))
    return self.send(502,json.dumps({"error":"Fixture API HTTP "+str(e.code)}))
   except Exception as e:return self.send(502,json.dumps({"error":type(e).__name__+": "+str(e)[:140]}))
 
  def top10(self):
   if CACHE["data"] and time.time()-CACHE["time"]<3600:return self.send(200,json.dumps(CACHE["data"]))
   saved=stored_get("top10")
-  if saved and time.time()-saved[1]<3600:return self.send(200,json.dumps(saved[0]))
+  if saved and (time.time()-saved[1]<3600 or time.time()<blocked_until()):return self.send(200,json.dumps(dict(saved[0],stale=time.time()-saved[1]>=3600)))
   token=os.getenv("TENNIS_API_TOKEN")
   if not token:return self.send(503,json.dumps({"error":"API token missing"}))
   def get(endpoint):
@@ -220,6 +236,7 @@ class Handler(BaseHTTPRequestHandler):
      pct=100*max(p1[0],p2[0])/total
      results.append({"player1":a,"player2":b,"favorite":fav,"probability":round(pct,1),"surface":m.get("surface"),"tour":m.get("tour"),"match_id":mid,"timestamp":p1[1] or p2[1]})
     except HTTPError as e:
+     if e.code==429:record_limit()
      if e.code in (401,403,429):break
     except Exception:continue
    results.sort(key=lambda x:x["probability"],reverse=True)
@@ -227,7 +244,9 @@ class Handler(BaseHTTPRequestHandler):
    CACHE.update(time=time.time(),data=output)
    stored_put("top10",output)
    return self.send(200,json.dumps(output))
-  except HTTPError as e:return self.send(200,json.dumps({"top10":[],"matched":0,"error":"Market lookup HTTP "+str(e.code),"note":"Market prices may require PRO access."}))
+  except HTTPError as e:
+   if e.code==429:record_limit()
+   return self.send(200,json.dumps({"top10":[],"matched":0,"error":"Market lookup HTTP "+str(e.code),"note":"Market prices may require PRO access."}))
   except Exception as e:return self.send(200,json.dumps({"top10":[],"matched":0,"error":str(e)[:120]}))
 
 if __name__=="__main__":
