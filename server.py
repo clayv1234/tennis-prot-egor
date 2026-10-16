@@ -105,6 +105,15 @@ def upstream(endpoint):
  except Exception as e:
   if isinstance(e,RuntimeError):raise
   raise RuntimeError("CitoAPI connection error: "+type(e).__name__)
+def response_shape(data):
+ if isinstance(data,list):return {"type":"list","length":len(data)}
+ if isinstance(data,dict):
+  shape={"type":"object","keys":list(data.keys())[:20]}
+  for k,v in data.items():
+   if isinstance(v,list):shape[k]={"type":"list","length":len(v)}
+   elif isinstance(v,dict):shape[k]={"type":"object","keys":list(v.keys())[:15]}
+  return shape
+ return {"type":type(data).__name__}
 def records(data):
  if isinstance(data,list):return data
  if isinstance(data,dict):
@@ -196,10 +205,13 @@ def run_scan():
   try:
    raw_live=upstream("matches/live")
    all_matches=records(raw_live)
+   live_shape=response_shape(raw_live)
+   upcoming_shape=None
    # The second call retrieves upcoming matches; never exceed the shared 25/day cap.
    errors=[];requests=0;profiles={}
    try:
     raw_upcoming=upstream("matches/upcoming")
+    upcoming_shape=response_shape(raw_upcoming)
     seen={str(m.get("id") or m.get("match_id") or i) for i,m in enumerate(all_matches) if isinstance(m,dict)}
     for m in records(raw_upcoming):
      if isinstance(m,dict):
@@ -225,7 +237,7 @@ def run_scan():
    copied["players"]=sides
    result=summarize(copied)
    if result:results.append(result)
-  output={"matches":results,"scanned_at":datetime.now(timezone.utc).isoformat(),"cached":False,"meta":{"fixture_page_count":len(all_matches),"in_window":len(matches),"profile_requests":0,"profiles_available":0,"profile_errors":errors,"limited_to_first_page":len(all_matches)>=100},"note":"CitoAPI manual scan. Detailed player stats require separate schema validation.","quota":quota_status()}
+  output={"matches":results,"scanned_at":datetime.now(timezone.utc).isoformat(),"cached":False,"meta":{"fixture_page_count":len(all_matches),"in_window":len(matches),"profile_requests":0,"profiles_available":0,"profile_errors":errors,"limited_to_first_page":len(all_matches)>=100,"response_shapes":{"live":live_shape,"upcoming":upcoming_shape}},"note":"CitoAPI manual scan. Inspect response_shapes if fixture count is zero; no secrets or player records are exposed.","quota":quota_status()}
   stored_put("manual:last",output)
   return 200,output
  finally:SCAN_LOCK.release()
