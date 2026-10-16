@@ -6,7 +6,9 @@ from urllib.request import Request,urlopen
 from urllib.error import HTTPError
 CACHE={"time":0,"data":None}
 PLAYER_CACHE={}
-PLAYER_CACHE_TTL=21600
+PLAYER_CACHE_TTL=86400
+ENRICHED_CACHE={}
+RATE_LIMIT_UNTIL=0
 BASE="https://api.livetennisapi.com/api/public/v1/"
 class Handler(BaseHTTPRequestHandler):
  def send(self,status,body,ctype="application/json"):
@@ -35,11 +37,18 @@ class Handler(BaseHTTPRequestHandler):
 
 
  def enriched(self,query):
+  global RATE_LIMIT_UNTIL
   token=os.getenv("TENNIS_API_TOKEN")
   if not token:return self.send(503,json.dumps({"error":"API token not configured"}))
   args=parse_qs(query)
   offset=min(900,max(0,int(args.get("offset",["0"])[0])))
   limit=min(50,max(1,int(args.get("limit",["25"])[0])))
+  key=(offset,limit)
+  old=ENRICHED_CACHE.get(key)
+  if old and (time.time()-old["at"]<3600 or time.time()<RATE_LIMIT_UNTIL):
+   cached=dict(old["data"]);cached["meta"]=dict(cached["meta"]);cached["meta"]["cached"]=True;cached["meta"]["rate_limited"]=time.time()<RATE_LIMIT_UNTIL
+   return self.send(200,json.dumps(cached))
+  if time.time()<RATE_LIMIT_UNTIL:return self.send(429,json.dumps({"error":"Tennis API rate limit. Retry later; cached data unavailable.","retry_seconds":int(RATE_LIMIT_UNTIL-time.time())}))
   def get(endpoint):
    with urlopen(Request(BASE+endpoint,headers={"X-API-Key":token,"Accept":"application/json"}),timeout=20) as r:return json.load(r)
   def roster(m):
@@ -74,11 +83,13 @@ class Handler(BaseHTTPRequestHandler):
      profile=get("players/"+str(pid))
      if isinstance(profile,dict) and isinstance(profile.get("data"),dict):profile=profile["data"]
      return pid,profile,None
-    except HTTPError as e:return pid,None,"HTTP "+str(e.code)
+    except HTTPError as e:
+     if e.code==429:RATE_LIMIT_UNTIL=time.time()+900
+     return pid,None,"HTTP "+str(e.code)
     except Exception as e:return pid,None,type(e).__name__
-   # Twelve per page; avoid rapid quota exhaustion.
+   # Fetch only two new profiles per batch to preserve API quota.
    with ThreadPoolExecutor(max_workers=3) as pool:
-    futures=[pool.submit(fetch,pid) for pid in missing[:12]]
+    futures=[pool.submit(fetch,pid) for pid in missing[:2]]
     for future in as_completed(futures):
      pid,profile,error=future.result()
      if isinstance(profile,dict):PLAYER_CACHE[pid]={"at":time.time(),"profile":profile}
@@ -102,17 +113,26 @@ class Handler(BaseHTTPRequestHandler):
      profiles.append(side)
     copied["players"]=profiles
     enriched.append(copied)
-   output={"data":enriched,"meta":{"fixtures":len(enriched),"player_ids":len(ids),"profiles_cached":sum(pid in PLAYER_CACHE for pid in ids),"profiles_with_stats":with_stats,"profiles_with_elo_fields":with_elo,"named_sides":with_names,"profiles_requested":min(12,len(missing)),"profile_errors":errors,"sample_fixture_fields":sorted(list(fixtures[0].keys())) if fixtures else [],"sample_player_fields":sorted(list(roster(fixtures[0])[0].keys())) if fixtures else [],"note":"Current profile Elo is not historical 30-day Elo momentum. Full serve/return comparisons need a separate data source."}}
+   output={"data":enriched,"meta":{"fixtures":len(enriched),"player_ids":len(ids),"profiles_cached":sum(pid in PLAYER_CACHE for pid in ids),"profiles_with_stats":with_stats,"profiles_with_elo_fields":with_elo,"named_sides":with_names,"profiles_requested":min(2,len(missing)),"profile_errors":errors,"sample_fixture_fields":sorted(list(fixtures[0].keys())) if fixtures else [],"sample_player_fields":sorted(list(roster(fixtures[0])[0].keys())) if fixtures else [],"note":"Current profile Elo is not historical 30-day Elo momentum. Full serve/return comparisons need a separate data source."}}
+   ENRICHED_CACHE[key]={"at":time.time(),"data":output}
    return self.send(200,json.dumps(output))
-  except HTTPError as e:return self.send(502,json.dumps({"error":"Fixture API HTTP "+str(e.code)}))
+  except HTTPError as e:
+   if e.code==429:
+    RATE_LIMIT_UNTIL=time.time()+900
+    if old:
+     cached=dict(old["data"]);cached["meta"]=dict(cached["meta"]);cached["meta"]["cached"]=True;cached["meta"]["rate_limited"]=True
+     return self.send(200,json.dumps(cached))
+    return self.send(429,json.dumps({"error":"Tennis API HTTP 429: quota exhausted. Automatic retry after cooldown.","retry_seconds":900}))
+   return self.send(502,json.dumps({"error":"Fixture API HTTP "+str(e.code)}))
   except Exception as e:return self.send(502,json.dumps({"error":type(e).__name__+": "+str(e)[:140]}))
 
  def top10(self):
-  if CACHE["data"] and time.time()-CACHE["time"]<300:return self.send(200,json.dumps(CACHE["data"]))
+  if CACHE["data"] and time.time()-CACHE["time"]<3600:return self.send(200,json.dumps(CACHE["data"]))
   token=os.getenv("TENNIS_API_TOKEN")
   if not token:return self.send(503,json.dumps({"error":"API token missing"}))
   def get(endpoint):
    with urlopen(Request(BASE+endpoint,headers={"X-API-Key":token,"Accept":"application/json"}),timeout=15) as r:return json.load(r)
+  if time.time()<RATE_LIMIT_UNTIL:return self.send(200,json.dumps({"top10":[],"error":"Rate-limit cooldown: market requests paused to protect fixture quota"}))
   try:
    matches=[]
    for status in ("upcoming","live"):
