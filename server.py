@@ -285,20 +285,20 @@ def analyze_match(match_id):
  # Provider documentation confirms /players/{id}/stats without a surface parameter.
  # Use one unfiltered request per player to avoid the invalid-surface HTTP 422.
  # Never retry failed endpoints during this analysis.
+ # Strict zero-request reanalysis: use only historical responses already cached.
+ # Do not spend quota until the provider response schema is mapped and tested.
  for p in players:
   pid=quote(str(p["id"]),safe="")
-  try:
-   data,new=cached_fetch("players/"+pid+"/stats")
-   fetched+=int(new)
-   stats.append(extract_metrics(data))
-   if not stats[-1]:issues.append(str(p["name"])+" stats response had no recognized ProT serve/return fields.")
-  except RuntimeError as e:
-   issues.append(str(p["name"])+" stats: "+str(e))
+  saved_stats=stored_get("cito:historical:players/"+pid+"/stats")
+  if saved_stats and isinstance(saved_stats[0],dict) and not saved_stats[0].get("_endpoint_error"):
+   stats.append(extract_metrics(saved_stats[0]))
+  else:
    stats.append({})
-  # Read previously cached recent form without spending another provider request.
+   issues.append(str(p["name"])+": no successful cached historical stats response")
   cached_form=stored_get("cito:historical:players/"+pid+"/form")
-  forms.append(numeric_fields(unwrap(cached_form[0])) if cached_form and isinstance(cached_form[0],dict) else {})
+  forms.append(numeric_fields(unwrap(cached_form[0])) if cached_form and isinstance(cached_form[0],dict) and not cached_form[0].get("_endpoint_error") else {})
  h2h=None
+ issues.append("Quota protection: this analysis uses cached responses only (zero new CitoAPI calls).")
  comparisons=[];counts=[0,0]
  for label,_,direction in METRICS:
   a,b=stats[0].get(label),stats[1].get(label)
@@ -328,7 +328,7 @@ def analyze_match(match_id):
  match["h2h"]=h2h if isinstance(h2h,dict) else None
  match["analysis_issues"]=issues
  match["historical_requests"]=fetched
- match["historical_scope"]="CitoAPI career serve/return statistics (no surface filter); recent form from cache only. Exact-surface stats require a separately validated query."
+ match["historical_scope"]="Cached CitoAPI career statistics only; no new provider requests. Exact-surface data not established."
  match["prot_pass"]=coverage==10 and max(counts)>=7
  # Cache analyzed match and reuse it on page reload without extra provider requests.
  stored_put("analysis:"+str(match_id),match)
