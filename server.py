@@ -33,31 +33,42 @@ class Handler(BaseHTTPRequestHandler):
   except Exception as e:return self.send(502,json.dumps({"error":"Tennis API connection failed","detail":str(e)}))
 
 
+
  def enriched(self,query):
   token=os.getenv("TENNIS_API_TOKEN")
   if not token:return self.send(503,json.dumps({"error":"API token not configured"}))
   args=parse_qs(query)
   offset=min(900,max(0,int(args.get("offset",["0"])[0])))
-  limit=min(40,max(1,int(args.get("limit",["25"])[0])))
+  limit=min(50,max(1,int(args.get("limit",["25"])[0])))
   def get(endpoint):
-   with urlopen(Request(BASE+endpoint,headers={"X-API-Key":token,"Accept":"application/json"}),timeout=18) as r:return json.load(r)
+   with urlopen(Request(BASE+endpoint,headers={"X-API-Key":token,"Accept":"application/json"}),timeout=20) as r:return json.load(r)
+  def roster(m):
+   p=m.get("players")
+   if isinstance(p,dict):
+    sides=[p.get("p1") or p.get("player1"),p.get("p2") or p.get("player2")]
+   elif isinstance(p,list):sides=p[:2]
+   else:sides=[m.get("player1") or m.get("home_player"),m.get("player2") or m.get("away_player")]
+   while len(sides)<2:sides.append(None)
+   output=[]
+   for i,s in enumerate(sides):
+    s=dict(s) if isinstance(s,dict) else {"name":s} if isinstance(s,str) else {}
+    if not s.get("id"):
+     s["id"]=s.get("player_id") or m.get("player"+str(i+1)+"_id")
+    if not s.get("name"):
+     s["name"]=s.get("full_name") or s.get("player_name") or m.get("player"+str(i+1)+"_name")
+    output.append(s)
+   return output
   try:
-   result=get("fixtures?"+urlencode({"draw":"singles","limit":limit,"offset":offset}))
-   fixtures=result.get("data",result.get("fixtures",[])) if isinstance(result,dict) else result
+   raw=get("fixtures?"+urlencode({"draw":"singles","limit":limit,"offset":offset}))
+   fixtures=raw.get("data",raw.get("fixtures",[])) if isinstance(raw,dict) else raw
    if not isinstance(fixtures,list):fixtures=[]
    ids=set()
-   def players(m):
-    p=m.get("players") or {}
-    if isinstance(p,dict):
-     return [p.get("p1"),p.get("p2")]
-    if isinstance(p,list):return p[:2]
-    return [m.get("player1") or m.get("home_player"),m.get("player2") or m.get("away_player")]
    for m in fixtures:
-    for p in players(m):
-     if not isinstance(p,dict):continue
-     pid=p.get("id") or p.get("player_id")
-     if isinstance(pid,int) or (isinstance(pid,str) and pid.isdigit()):ids.add(int(pid))
-   missing=[pid for pid in ids if pid not in PLAYER_CACHE or time.time()-PLAYER_CACHE[pid]["at"]>PLAYER_CACHE_TTL]
+    for p in roster(m):
+     pid=p.get("id")
+     if pid and str(pid).isdigit():ids.add(int(pid))
+   missing=[pid for pid in sorted(ids) if pid not in PLAYER_CACHE or time.time()-PLAYER_CACHE[pid]["at"]>PLAYER_CACHE_TTL]
+   errors={}
    def fetch(pid):
     try:
      profile=get("players/"+str(pid))
@@ -65,33 +76,33 @@ class Handler(BaseHTTPRequestHandler):
      return pid,profile,None
     except HTTPError as e:return pid,None,"HTTP "+str(e.code)
     except Exception as e:return pid,None,type(e).__name__
-   errors={}
-   # Cap profile reads to avoid burning a user's API quota in one scan.
+   # Twelve per page; avoid rapid quota exhaustion.
    with ThreadPoolExecutor(max_workers=3) as pool:
-    futures=[pool.submit(fetch,pid) for pid in missing[:24]]
+    futures=[pool.submit(fetch,pid) for pid in missing[:12]]
     for future in as_completed(futures):
      pid,profile,error=future.result()
-     if profile:PLAYER_CACHE[pid]={"at":time.time(),"profile":profile}
+     if isinstance(profile,dict):PLAYER_CACHE[pid]={"at":time.time(),"profile":profile}
      elif error:errors[str(pid)]=error
-   enriched=[]
+   enriched=[];with_elo=0;with_names=0;with_stats=0
    for m in fixtures:
-    sides=players(m)
-    copied=dict(m)
-    names=[]
-    for i,p in enumerate(sides):
-     pid=(p.get("id") or p.get("player_id")) if isinstance(p,dict) else None
+    copied=dict(m); sides=roster(m); profiles=[]
+    for side in sides:
+     pid=side.get("id")
      cached=PLAYER_CACHE.get(int(pid)) if pid and str(pid).isdigit() else None
-     profile=cached["profile"] if cached else None
-     side=dict(p) if isinstance(p,dict) else {"name":str(p)} if p else {}
+     profile=cached["profile"] if cached else {}
      if profile:
+      for key in ("name","ranking","ranking_points","ranking_movement","country"):
+       if side.get(key) is None and profile.get(key) is not None:side[key]=profile[key]
       side["stats"]=profile.get("stats") or {}
-      side["ranking"]=profile.get("ranking")
-      side["profile_source"]="GET /players/"+str(pid)
-     names.append(side)
-    copied["players"]=names
+      side["profile_source"]="LiveTennisAPI /players/{id}"
+     if side.get("name"):with_names+=1
+     if side.get("stats"):with_stats+=1
+     rating=(side.get("stats") or {}).get("ratings")
+     if rating is not None and "elo" in json.dumps(rating).lower():with_elo+=1
+     profiles.append(side)
+    copied["players"]=profiles
     enriched.append(copied)
-   stats_found=sum(1 for m in enriched for p in m["players"] if p.get("stats"))
-   output={"data":enriched,"meta":{"fixtures":len(enriched),"player_ids":len(ids),"profiles_cached":sum(pid in PLAYER_CACHE for pid in ids),"profiles_with_stats":stats_found,"profiles_requested":min(24,len(missing)),"profile_errors":errors,"note":"Cached player profiles provide season and ratings fields only where supplied. Full ten-category serve/return stats may be absent."}}
+   output={"data":enriched,"meta":{"fixtures":len(enriched),"player_ids":len(ids),"profiles_cached":sum(pid in PLAYER_CACHE for pid in ids),"profiles_with_stats":with_stats,"profiles_with_elo_fields":with_elo,"named_sides":with_names,"profiles_requested":min(12,len(missing)),"profile_errors":errors,"sample_fixture_fields":sorted(list(fixtures[0].keys())) if fixtures else [],"sample_player_fields":sorted(list(roster(fixtures[0])[0].keys())) if fixtures else [],"note":"Current profile Elo is not historical 30-day Elo momentum. Full serve/return comparisons need a separate data source."}}
    return self.send(200,json.dumps(output))
   except HTTPError as e:return self.send(502,json.dumps({"error":"Fixture API HTTP "+str(e.code)}))
   except Exception as e:return self.send(502,json.dumps({"error":type(e).__name__+": "+str(e)[:140]}))
