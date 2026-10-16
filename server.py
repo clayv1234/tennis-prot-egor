@@ -282,18 +282,23 @@ def analyze_match(match_id):
   return 422,{"error":"Fixture has no player IDs. Cannot fetch historical statistics reliably.","match":match}
  from urllib.parse import quote
  fetched=0;issues=[];stats=[];forms=[]
- # Cost-conscious mode: use the two known-working form endpoints only.
- # Player stats endpoints returned HTTP 422; do not retry them.
- # H2H is skipped to avoid spending a fifth request on an unconfirmed endpoint.
+ # Provider documentation confirms /players/{id}/stats without a surface parameter.
+ # Use one unfiltered request per player to avoid the invalid-surface HTTP 422.
+ # Never retry failed endpoints during this analysis.
  for p in players:
   pid=quote(str(p["id"]),safe="")
-  stats.append({})
   try:
-   data,new=cached_fetch("players/"+pid+"/form")
-   fetched+=int(new);forms.append(numeric_fields(unwrap(data)))
-  except RuntimeError as e:issues.append(str(p["name"])+" form: "+str(e));forms.append({})
+   data,new=cached_fetch("players/"+pid+"/stats")
+   fetched+=int(new)
+   stats.append(extract_metrics(data))
+   if not stats[-1]:issues.append(str(p["name"])+" stats response had no recognized ProT serve/return fields.")
+  except RuntimeError as e:
+   issues.append(str(p["name"])+" stats: "+str(e))
+   stats.append({})
+  # Read previously cached recent form without spending another provider request.
+  cached_form=stored_get("cito:historical:players/"+pid+"/form")
+  forms.append(numeric_fields(unwrap(cached_form[0])) if cached_form and isinstance(cached_form[0],dict) else {})
  h2h=None
- issues.append("Detailed 10-category serve/return API endpoint disabled after HTTP 422 responses; historical form remains available.")
  comparisons=[];counts=[0,0]
  for label,_,direction in METRICS:
   a,b=stats[0].get(label),stats[1].get(label)
@@ -323,7 +328,7 @@ def analyze_match(match_id):
  match["h2h"]=h2h if isinstance(h2h,dict) else None
  match["analysis_issues"]=issues
  match["historical_requests"]=fetched
- match["historical_scope"]="CitoAPI recent form (30 days), two cached player requests maximum; detailed serve/return endpoint paused after HTTP 422."
+ match["historical_scope"]="CitoAPI career serve/return statistics (no surface filter); recent form from cache only. Exact-surface stats require a separately validated query."
  match["prot_pass"]=coverage==10 and max(counts)>=7
  # Cache analyzed match and reuse it on page reload without extra provider requests.
  stored_put("analysis:"+str(match_id),match)
